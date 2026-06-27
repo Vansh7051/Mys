@@ -20,11 +20,10 @@ def run_transpiler_engine(python_code):
         line_num = index + 1
         
         if not trimmed or trimmed.startswith('#'):
-            continue  # Skip blank lines and comments
+            continue  
             
-        # Catches completely random gibberish strings that don't follow any programming format
-        if not re.match(r'^[a-zA-Z_][a-zA-Z0-9_\s\.\(\)\"\']*(?:=.*|.*)?$', trimmed):
-            # If it's a structural keyword block missing its colon, allow it to pass to the next specific check
+        # Flexible Gibberish Check
+        if not re.match(r'^[a-zA-Z_0-9][a-zA-Z0-9_\s\.\(\)\"\':\-+=<>!]*$', trimmed):
             if not (trimmed.startswith(('if', 'elif', 'else', 'while', 'for', 'def'))):
                 return {
                     "status": "error",
@@ -51,8 +50,6 @@ def run_transpiler_engine(python_code):
                 "status": "error",
                 "message": f"❌ Python Syntax Error on line {line_num}: Expected a colon ':' at the end of the statement block."
             }
-        if trimmed == "else" or trimmed == "else ":
-            return {"status": "error", "message": f"❌ Python Syntax Error on line {line_num}: Expected ':' right after 'else'."}
 
     # ==========================================
     # ⚙️ STAGE 2: CORE TRANSPILATION LAYER
@@ -65,16 +62,16 @@ def run_transpiler_engine(python_code):
             cpp_body_statements.append(f"    // {trimmed[1:].strip()}")
             continue
 
-        # A. Universal Print Transpilation
-        if trimmed.startswith('print(') and trimmed.endswith(')'):
-            inner_content = trimmed[6:-1].strip()
-            # Handle pure strings
+        # A. Universal Print Transpilation (Super Flexible Match)
+        print_match = re.match(r'^print\s*\((.*)\)$', trimmed)
+        if print_match:
+            inner_content = print_match.group(1).strip()
+            # Check if it has any type of quotes around it
             if (inner_content.startswith('"') and inner_content.endswith('"')) or \
                (inner_content.startswith("'") and inner_content.endswith("'")):
                 text = inner_content[1:-1]
                 cpp_body_statements.append(f'    std::cout << "{text}" << std::endl;')
             else:
-                # Handle printing variables/expressions directly
                 cpp_body_statements.append(f'    std::cout << {inner_content} << std::endl;')
             continue
 
@@ -84,7 +81,6 @@ def run_transpiler_engine(python_code):
             var_name = parts[0].strip()
             var_val = parts[1].strip()
             
-            # Determine type safely based on assignment
             if var_val.isdigit():
                 var_type = "int"
             elif re.match(r'^\d+\.\d+$', var_val):
@@ -92,10 +88,10 @@ def run_transpiler_engine(python_code):
             elif var_val.lower() in ['true', 'false']:
                 var_type = "bool"
                 var_val = var_val.lower()
-            elif (var_val.startwith('"') or var_val.startswith("'")):
+            elif (var_val.startswith('"') or var_val.startswith("'")):
                 var_type = "std::string"
             else:
-                var_type = "auto" # Universal fallback type deduction
+                var_type = "auto" 
                 
             cpp_body_statements.append(f"    {var_type} {var_name} = {var_val};")
             continue
@@ -109,10 +105,7 @@ def run_transpiler_engine(python_code):
             condition = trimmed[4:-1].strip().rstrip(':')
             cpp_body_statements.append(f"    }} else if ({condition}) {{")
             continue
-        if trimmed.startswith('else:'):
-            cpp_body_statements.append("    } else {")
-            continue
-        if trimmed.rstrip(':') == 'else':
+        if trimmed.startswith('else:') or trimmed.rstrip(':') == 'else':
             cpp_body_statements.append("    } else {")
             continue
 
@@ -120,12 +113,12 @@ def run_transpiler_engine(python_code):
         processed_statement = trimmed.replace(':', '')
         cpp_body_statements.append(f"    {processed_statement};")
 
-    # Assemble raw C++ draft structure
+    # Assemble final C++ draft structure cleanly
     cpp_blocks = ["#include <iostream>", "#include <string>", "", "int main() {"]
     for statement in cpp_body_statements:
         cpp_blocks.append(statement)
         
-    # Handle auto-closing brackets for blocks safely during assembly
+    # Balanced check closing
     open_brackets = "".join(cpp_blocks).count("{")
     close_brackets = "".join(cpp_blocks).count("}")
     while open_brackets > close_brackets:
@@ -140,13 +133,11 @@ def run_transpiler_engine(python_code):
     # ==========================================
     # 🔬 CHECK 3: C++ SEMANTIC RE-VALIDATOR
     # ==========================================
-    # Triple-checks the generated C++ to make absolutely sure no compiler bugs slip past
     if "int main()" not in final_cpp_code:
         return {"status": "error", "message": "❌ Verification Failed: Structural error inside generated main()."}
     if final_cpp_code.count("{") != final_cpp_code.count("}"):
         return {"status": "error", "message": "❌ Verification Failed: Structural mismatch inside generated braces."}
     
-    # If all three stages pass with zero errors, return the beautifully converted code
     return {"status": "success", "cpp_code": final_cpp_code}
 
 @app.route('/transpile', methods=['POST'])
@@ -164,4 +155,4 @@ def handle_api_request():
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=8080)
-    
+        
