@@ -1,164 +1,166 @@
-import re
-import random
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, render_template_string
 from flask_cors import CORS
+import os
 
 app = Flask(__name__)
-CORS(app)  # Enables Cross-Origin Resource Sharing for browser/web client access
+CORS(app)  # Enables communication from frontend UI
 
-# Authentication Credentials
-API_KEY = "velo001"
-API_PASSWORD = "1234_4321"
+# 1. Global variable to store latest converted code for the microcontroller
+latest_cpp_code = "// No code transpiled yet."
 
-# ======================================================
-# TRANSPILER ENGINE (Python -> C++)
-# ======================================================
-def run_transpiler_engine(python_code):
-    if not python_code or not python_code.strip():
-        return {"status": "error", "message": "❌ Please enter some Python code first!"}
-
-    raw_lines = python_code.splitlines()
-    cpp_body_statements = []
-
-    for index, line in enumerate(raw_lines):
-        trimmed = line.strip()
-        line_num = index + 1
-
-        # Skip empty lines or standard comments
-        if not trimmed:
+def transpile_python_to_cpp(py_code):
+    """Simple Transpiler Logic"""
+    cpp_lines = [
+        "#include <iostream>",
+        "using namespace std;",
+        "",
+        "int main() {"
+    ]
+    for line in py_code.split('\n'):
+        line = line.strip()
+        if not line:
             continue
-        if trimmed.startswith('#'):
-            cpp_body_statements.append(f"    // {trimmed[1:].strip()}")
-            continue
+        if line.startswith("print(") and line.endswith(")"):
+            content = line[6:-1]
+            cpp_lines.append(f'    cout << {content} << endl;')
+        elif "=" in line and not line.startswith("if"):
+            var, val = line.split("=", 1)
+            cpp_lines.append(f'    auto {var.strip()} = {val.strip()};')
+        else:
+            cpp_lines.append(f'    // Unparsed line: {line}')
+            
+    cpp_lines.append("    return 0;")
+    cpp_lines.append("}")
+    return "\n".join(cpp_lines)
 
-        # 1. Capitalization Mistake Check
-        first_word = re.split(r'[^a-zA-Z]', trimmed)[0]
-        if first_word in ["Print", "If", "Elif", "Else", "While", "For"]:
-            return {
-                "status": "error",
-                "message": f"❌ Python NameError on line {line_num}: Did you mean lowercase '{first_word.lower()}'? Python is case-sensitive."
+# Embedded Web UI
+HTML_PORTAL = """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>PyToCpp - Live Portal</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-[#fafaf8] text-[#1c1c1b] font-sans min-h-screen flex flex-col justify-between">
+
+    <header class="bg-white border-b border-[#e7e5e4] px-6 py-4 flex justify-between items-center shadow-sm">
+        <div class="flex items-center gap-2">
+            <div class="w-2 h-2 bg-emerald-500 rounded-full animate-pulse"></div>
+            <span class="text-xs font-bold tracking-wider uppercase font-mono text-emerald-600">SERVER STATUS: ONLINE</span>
+        </div>
+    </header>
+
+    <main class="max-w-2xl w-full mx-auto p-6 flex-grow flex flex-col justify-center gap-6">
+        <div class="text-center mb-2">
+            <h1 class="text-2xl font-light text-[#0c0a09]">Python to C++ Transpiler</h1>
+            <p class="text-xs text-[#78716c] mt-1">Connected live to your pipeline endpoint.</p>
+        </div>
+
+        <div class="bg-white border border-[#e7e5e4] rounded-xl overflow-hidden shadow-sm">
+            <div class="bg-[#fcfcfb] border-b border-[#e7e5e4] px-4 py-2 flex justify-between items-center">
+                <span class="text-xs font-bold text-[#a8a29e] font-mono">📄 INPUT PYTHON</span>
+            </div>
+            <textarea id="myTextArea" class="w-full h-40 p-4 font-mono text-sm bg-white text-[#1c1c1b] focus:outline-none resize-none" placeholder="Type your Python code here...&#10;Example: print(&quot;hello&quot;)"></textarea>
+            <div class="bg-[#fcfcfb] border-t border-[#f5f5f4] px-4 py-3 flex justify-end">
+                <button id="mySubmitButton" class="bg-[#1c1c1b] hover:bg-black text-white text-xs font-bold px-6 py-2.5 rounded-lg tracking-wider uppercase transition-all shadow-sm">
+                    CONVERT TO C++
+                </button>
+            </div>
+        </div>
+
+        <div class="flex flex-col gap-2">
+            <div class="flex justify-between items-center">
+                <span class="text-xs font-bold text-[#a8a29e] font-mono">💻 C++ OUTPUT</span>
+                <span id="statusPill" class="text-[10px] font-bold bg-white text-[#78716c] border border-[#e7e5e4] px-2 py-0.5 rounded uppercase tracking-wider font-mono">Idle</span>
+            </div>
+            <div class="bg-white border border-[#e7e5e4] rounded-xl overflow-hidden shadow-sm">
+                <pre id="outputScreen" class="p-4 bg-[#fbfbfa] text-[#1c1c1b] font-mono text-xs min-h-[120px] whitespace-pre-wrap break-all">Waiting for instructions...</pre>
+            </div>
+        </div>
+    </main>
+
+    <script>
+        const TARGET_SERVER_URL = "/transpile";
+
+        async function processTranspilation() {
+            const userInputText = document.getElementById('myTextArea').value; 
+            const outputScreen = document.getElementById('outputScreen');
+            const statusPill = document.getElementById('statusPill');
+
+            if (!userInputText.trim()) {
+                alert("Please type some Python code first!");
+                return;
             }
 
-        # 2. Match Universal Prints: print(...)
-        print_match = re.match(r'^print\s*\((.*)\)$', trimmed)
-        if print_match:
-            inner_content = print_match.group(1).strip()
-            if (inner_content.startswith('"') and inner_content.endswith('"')) or \
-               (inner_content.startswith("'") and inner_content.endswith("'")):
-                text = inner_content[1:-1]
-                cpp_body_statements.append(f'    std::cout << "{text}" << std::endl;')
-            else:
-                cpp_body_statements.append(f'    std::cout << {inner_content} << std::endl;')
-            continue
+            statusPill.textContent = "Processing...";
+            statusPill.className = "text-[10px] font-bold bg-amber-50 text-amber-600 border border-amber-200 px-2 py-0.5 rounded uppercase tracking-wider font-mono";
+            outputScreen.textContent = "Converting Python code...";
 
-        # 3. Match Variable Assignments: x = value
-        if '=' in trimmed and not trimmed.startswith(('if', 'while', 'elif')):
-            parts = trimmed.split('=', 1)
-            var_name = parts[0].strip()
-            var_val = parts[1].strip()
+            try {
+                const response = await fetch(TARGET_SERVER_URL, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ user_code: userInputText })
+                });
 
-            if not re.match(r'^[a-zA-Z_][a-zA-Z0-9_*]*$', var_name):
-                return {"status": "error", "message": f"❌ Syntax Error on line {line_num}: Invalid variable name structure."}
+                const result = await response.json();
 
-            if var_val.isdigit():
-                var_type = "int"
-            elif re.match(r'^\d+\.\d+$', var_val):
-                var_type = "double"
-            elif var_val.lower() in ['true', 'false']:
-                var_type = "bool"
-                var_val = var_val.lower()
-            elif (var_val.startswith('"') or var_val.startswith("'")) and (var_val.endswith('"') or var_val.endswith("'")):
-                var_type = "std::string"
-            else:
-                var_type = "auto"
+                if (result.status === "success") {
+                    statusPill.textContent = "Success";
+                    statusPill.className = "text-[10px] font-bold bg-emerald-50 text-emerald-600 border border-emerald-200 px-2 py-0.5 rounded uppercase tracking-wider font-mono";
+                    outputScreen.textContent = result.cpp_code;
+                } else {
+                    statusPill.textContent = "Error";
+                    statusPill.className = "text-[10px] font-bold bg-red-50 text-red-600 border border-red-200 px-2 py-0.5 rounded uppercase tracking-wider font-mono";
+                    outputScreen.textContent = result.message || "An error occurred.";
+                }
 
-            cpp_body_statements.append(f"    {var_type} {var_name} = {var_val};")
-            continue
-
-        # 4. Match Control Flows
-        if trimmed.startswith(('if ', 'if(')) and trimmed.endswith(':'):
-            condition = trimmed[2:-1].strip().rstrip(':')
-            cpp_body_statements.append(f"    if ({condition}) {{")
-            continue
-        if trimmed.startswith(('elif ', 'elif(')) and trimmed.endswith(':'):
-            condition = trimmed[4:-1].strip().rstrip(':')
-            cpp_body_statements.append(f"    }} else if ({condition}) {{")
-            continue
-        if trimmed == "else:" or trimmed.replace(" ", "") == "else:":
-            cpp_body_statements.append("    } else {")
-            continue
-
-        # 5. Missing Colon Traps
-        if trimmed.startswith(('if ', 'if(', 'elif ', 'elif(', 'while ', 'for ', 'else')) and not trimmed.endswith(':'):
-            return {"status": "error", "message": f"❌ Python Syntax Error on line {line_num}: Expected a colon ':' at the end of the line."}
-
-        # 6. Fallback Error for Unrecognized Code
-        return {
-            "status": "error",
-            "message": f"❌ Python Syntax Error on line {line_num}: Unrecognized code statement or structure."
+            } catch (error) {
+                statusPill.textContent = "Error";
+                statusPill.className = "text-[10px] font-bold bg-red-100 text-red-700 border border-red-300 px-2 py-0.5 rounded uppercase tracking-wider font-mono";
+                outputScreen.textContent = "Could not connect to server.";
+            }
         }
 
-    # Assembly & Structural Closing
-    cpp_blocks = ["#include <iostream>", "#include <string>", "", "int main() {"]
-    for statement in cpp_body_statements:
-        cpp_blocks.append(statement)
+        document.getElementById('mySubmitButton').addEventListener('click', processTranspilation);
+    </script>
+</body>
+</html>
+"""
 
-    open_brackets = "".join(cpp_blocks).count("{")
-    close_brackets = "".join(cpp_blocks).count("}")
-    while open_brackets > close_brackets:
-        cpp_blocks.append("    }")
-        close_brackets += 1
+@app.route('/')
+def home():
+    """Serves the Web UI"""
+    return render_template_string(HTML_PORTAL)
 
-    cpp_blocks.append("    return 0;")
-    cpp_blocks.append("}")
-
-    return {"status": "success", "cpp_code": "\n".join(cpp_blocks)}
-
-
-# ======================================================
-# ROUTE 1: GET SECURITY CODE (/getcode)
-# ======================================================
-@app.route("/getcode", methods=["POST"])
-def get_code():
+@app.route('/transpile', methods=['POST'])
+def transpile():
+    """Called by Website: Transpiles Python and stores C++ in memory"""
+    global latest_cpp_code
     data = request.get_json(silent=True) or {}
-    key = data.get("api_key")
-    password = data.get("password")
+    user_code = data.get('user_code', '')
 
-    if key == API_KEY and password == API_PASSWORD:
-        code = random.randint(100000, 999999)
-        print("Generated Code:", code)
-        return jsonify({
-            "status": "success",
-            "code": code
-        }), 200
-    else:
-        return jsonify({
-            "status": "failed",
-            "message": "Wrong Key or Password"
-        }), 401
+    if not user_code:
+        return jsonify({"status": "error", "message": "No Python code provided"}), 400
 
+    latest_cpp_code = transpile_python_to_cpp(user_code)
 
-# ======================================================
-# ROUTE 2: PYTHON TO C++ TRANSPILER (/transpile)
-# ======================================================
-@app.route("/transpile", methods=["POST"])
-def handle_transpile():
-    try:
-        data = request.get_json(silent=True)
-        if not data:
-            return jsonify({"status": "error", "message": "No data received"}), 400
+    return jsonify({
+        "status": "success",
+        "cpp_code": latest_cpp_code
+    }), 200
 
-        user_python_input = data.get("user_code", "")
-        result = run_transpiler_engine(user_python_input)
-        return jsonify(result), 200
-    except Exception as e:
-        return jsonify({"status": "error", "message": str(e)}), 500
+@app.route('/getcode', methods=['GET'])
+def get_code():
+    """Called by ESP8266/ESP32: Returns the stored C++ code"""
+    return jsonify({
+        "status": "success",
+        "cpp_code": latest_cpp_code
+    }), 200
 
-
-# ======================================================
-# START SERVER
-# ======================================================
 if __name__ == '__main__':
-    # threaded=True ensures smooth handling for multiple connected ESP8266 devices
-    app.run(host="0.0.0.0", port=5000, threaded=True)
-    
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host='0.0.0.0', port=port)
+            
