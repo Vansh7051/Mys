@@ -1,24 +1,29 @@
 import re
+import random
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 
 app = Flask(__name__)
-CORS(app)
+CORS(app)  # Enables Cross-Origin Resource Sharing for browser/web client access
 
+# Authentication Credentials
+API_KEY = "velo001"
+API_PASSWORD = "1234_4321"
+
+# ======================================================
+# TRANSPILER ENGINE (Python -> C++)
+# ======================================================
 def run_transpiler_engine(python_code):
     if not python_code or not python_code.strip():
         return {"status": "error", "message": "❌ Please enter some Python code first!"}
 
     raw_lines = python_code.splitlines()
     cpp_body_statements = []
-    
-    # ==========================================
-    # 🕵️ CHECK 1 & STAGE 2: VALIDATION & PARSING
-    # ==========================================
+
     for index, line in enumerate(raw_lines):
         trimmed = line.strip()
         line_num = index + 1
-        
+
         # Skip empty lines or standard comments
         if not trimmed:
             continue
@@ -51,8 +56,7 @@ def run_transpiler_engine(python_code):
             parts = trimmed.split('=', 1)
             var_name = parts[0].strip()
             var_val = parts[1].strip()
-            
-            # Simple alphanumeric variable validation
+
             if not re.match(r'^[a-zA-Z_][a-zA-Z0-9_*]*$', var_name):
                 return {"status": "error", "message": f"❌ Syntax Error on line {line_num}: Invalid variable name structure."}
 
@@ -66,8 +70,8 @@ def run_transpiler_engine(python_code):
             elif (var_val.startswith('"') or var_val.startswith("'")) and (var_val.endswith('"') or var_val.endswith("'")):
                 var_type = "std::string"
             else:
-                var_type = "auto" 
-                
+                var_type = "auto"
+
             cpp_body_statements.append(f"    {var_type} {var_name} = {var_val};")
             continue
 
@@ -88,43 +92,73 @@ def run_transpiler_engine(python_code):
         if trimmed.startswith(('if ', 'if(', 'elif ', 'elif(', 'while ', 'for ', 'else')) and not trimmed.endswith(':'):
             return {"status": "error", "message": f"❌ Python Syntax Error on line {line_num}: Expected a colon ':' at the end of the line."}
 
-        # 6. Absolute Gibberish Fallback (If line matches nothing above, it is fake code)
+        # 6. Fallback Error for Unrecognized Code
         return {
             "status": "error",
-            "message": f"❌ Python Syntax Error on line {line_num}: Unrecognized code statement or gibberish text structure."
+            "message": f"❌ Python Syntax Error on line {line_num}: Unrecognized code statement or structure."
         }
 
-    # ==========================================
-    # 🔬 ASSEMBLY & STRUCTURAL AUTO-CLOSING
-    # ==========================================
+    # Assembly & Structural Closing
     cpp_blocks = ["#include <iostream>", "#include <string>", "", "int main() {"]
     for statement in cpp_body_statements:
         cpp_blocks.append(statement)
-        
+
     open_brackets = "".join(cpp_blocks).count("{")
     close_brackets = "".join(cpp_blocks).count("}")
     while open_brackets > close_brackets:
         cpp_blocks.append("    }")
         close_brackets += 1
-        
+
     cpp_blocks.append("    return 0;")
     cpp_blocks.append("}")
-    
+
     return {"status": "success", "cpp_code": "\n".join(cpp_blocks)}
 
-@app.route('/transpile', methods=['POST'])
-def handle_api_request():
+
+# ======================================================
+# ROUTE 1: GET SECURITY CODE (/getcode)
+# ======================================================
+@app.route("/getcode", methods=["POST"])
+def get_code():
+    data = request.get_json(silent=True) or {}
+    key = data.get("api_key")
+    password = data.get("password")
+
+    if key == API_KEY and password == API_PASSWORD:
+        code = random.randint(100000, 999999)
+        print("Generated Code:", code)
+        return jsonify({
+            "status": "success",
+            "code": code
+        }), 200
+    else:
+        return jsonify({
+            "status": "failed",
+            "message": "Wrong Key or Password"
+        }), 401
+
+
+# ======================================================
+# ROUTE 2: PYTHON TO C++ TRANSPILER (/transpile)
+# ======================================================
+@app.route("/transpile", methods=["POST"])
+def handle_transpile():
     try:
-        data = request.get_json()
+        data = request.get_json(silent=True)
         if not data:
             return jsonify({"status": "error", "message": "No data received"}), 400
-            
+
         user_python_input = data.get("user_code", "")
         result = run_transpiler_engine(user_python_input)
-        return jsonify(result)
+        return jsonify(result), 200
     except Exception as e:
         return jsonify({"status": "error", "message": str(e)}), 500
 
+
+# ======================================================
+# START SERVER
+# ======================================================
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=8080)
+    # threaded=True ensures smooth handling for multiple connected ESP8266 devices
+    app.run(host="0.0.0.0", port=5000, threaded=True)
     
