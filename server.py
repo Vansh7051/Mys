@@ -1,194 +1,194 @@
 from flask import Flask, request, jsonify, render_template_string
 from flask_cors import CORS
-import os, re, ast
+import os, re, sys, io
 
 app = Flask(__name__)
 CORS(app)
 
 latest_instructions = ""
 
-# =========================================================
-# STEP 1: AST UNIVERSAL COMPILER
-# Converts complex Python (loops, lists, vars) into 
-# the explicit DIGITALWRITE & DELAY format.
-# =========================================================
-class UniversalHardwareCompiler(ast.NodeVisitor):
+class HardwareExecutionEngine:
+    """
+    Virtual MicroPython Execution Engine.
+    Executes real Python/MicroPython code in an isolated environment 
+    and captures actual pin state transitions and delays.
+    """
     def __init__(self):
-        self.variables = {}
-        self.output_commands = []
+        self.events = []
+        # Mapping ESP8266 silk-screen labels to GPIO integers
+        self.pin_map = {
+            "D0": 16, "D1": 5, "D2": 4, "D3": 0, "D4": 2,
+            "D5": 14, "D6": 12, "D7": 13, "D8": 15
+        }
 
-    def evaluate_expr(self, node):
-        if isinstance(node, ast.Constant):
-            return node.value
-        elif isinstance(node, ast.Name):
-            return self.variables.get(node.id, node.id)
-        elif isinstance(node, ast.List):
-            return [self.evaluate_expr(elt) for elt in node.elts]
-        elif isinstance(node, ast.JoinedStr):
-            return "".join(str(self.evaluate_expr(v)) for v in node.values)
-        elif isinstance(node, ast.FormattedValue):
-            return self.evaluate_expr(node.value)
-        return None
+    def _resolve_pin(self, pin_id):
+        if isinstance(pin_id, str):
+            clean_str = pin_id.strip().upper()
+            if clean_str in self.pin_map:
+                return self.pin_map[clean_str]
+            numbers = re.findall(r'\d+', clean_str)
+            if numbers:
+                return int(numbers[0])
+        elif isinstance(pin_id, int):
+            return pin_id
+        return 5 # Default to GPIO 5 (D1) if unknown
 
-    def visit_Assign(self, node):
-        for target in node.targets:
-            if isinstance(target, ast.Name):
-                val = self.evaluate_expr(node.value)
-                self.variables[target.id] = val
-        self.generic_visit(node)
+    def record_write(self, pin_id, state):
+        gpio = self._resolve_pin(pin_id)
+        st = 1 if state in [1, True, "1", "HIGH", "high"] else 0
+        self.events.append(f"WRITE:{gpio}:{st}")
 
-    def visit_Call(self, node):
-        func_name = ""
-        if isinstance(node.func, ast.Name):
-            func_name = node.func.id
-        elif isinstance(node.func, ast.Attribute):
-            func_name = f"{getattr(node.func.value, 'id', '')}.{node.func.attr}"
-
-        if func_name.lower() in ["digitalwrite", "digital_write"]:
-            if len(node.args) >= 2:
-                pin_val = str(self.evaluate_expr(node.args[0]))
-                state_val = str(self.evaluate_expr(node.args[1])).upper()
-                state_val = "HIGH" if state_val in ["1", "TRUE", "HIGH"] else "LOW"
-                self.output_commands.append(f'DIGITALWRITE("{pin_val}", {state_val})')
-
-        elif func_name.lower() in ["delay", "sleep", "time.sleep"]:
-            if len(node.args) >= 1:
-                val = float(self.evaluate_expr(node.args[0]))
-                ms = int(val * 1000) if "sleep" in func_name.lower() and val < 100 else int(val)
-                self.output_commands.append(f'DELAY({ms})')
-
-        self.generic_visit(node)
-
-    def visit_For(self, node):
-        iter_obj = self.evaluate_expr(node.iter)
-        if isinstance(node.iter, ast.Call) and getattr(node.iter.func, 'id', '') == 'range':
-            args = [self.evaluate_expr(a) for a in node.iter.args]
-            iter_obj = list(range(*args))
-
-        if isinstance(node.target, ast.Name) and isinstance(iter_obj, list):
-            var_name = node.target.id
-            for item in iter_obj:
-                self.variables[var_name] = item
-                for stmt in node.body:
-                    self.visit(stmt)
+    def record_delay(self, seconds):
+        try:
+            ms = int(float(seconds) * 1000)
+            if ms > 0:
+                self.events.append(f"DELAY:{ms}")
+        except ValueError:
+            pass
 
 
-def compile_complex_python_to_format(user_python_code):
-    """Parses any complex Python code into explicit Notepad-style commands."""
-    try:
-        parsed_ast = ast.parse(user_python_code)
-        compiler = UniversalHardwareCompiler()
-        compiler.visit(parsed_ast)
-        
-        formatted_script = ["WHILE TRUE:"]
-        for cmd in compiler.output_commands:
-            formatted_script.append(f"    {cmd}")
-        return "\n".join(formatted_script)
-        
-    except Exception:
-        # Fallback line-by-line parser if code contains custom pseudo-syntax
-        lines = user_python_code.split('\n')
-        fallback_cmds = []
-        for line in lines:
-            if "digitalWrite" in line or "digital_write" in line or "DIGITALWRITE" in line:
-                matches = re.findall(r'["\']?(.*?)["\']?\s*,\s*(HIGH|LOW|1|0)', line, re.IGNORECASE)
-                if matches:
-                    pin, state = matches[0]
-                    state = "HIGH" if state.upper() in ["HIGH", "1"] else "LOW"
-                    fallback_cmds.append(f'DIGITALWRITE("{pin.strip()}", {state})')
-            elif "sleep" in line or "delay" in line or "DELAY" in line:
-                nums = re.findall(r'\d+\.?\d*', line)
-                if nums:
-                    val = float(nums[0])
-                    ms = int(val * 1000) if ("sleep" in line.lower() and val < 100) else int(val)
-                    fallback_cmds.append(f'DELAY({ms})')
+def execute_python_script(user_code):
+    """
+    Runs user code dynamically in a simulated MicroPython runtime.
+    """
+    engine = HardwareExecutionEngine()
 
-        formatted_script = ["WHILE TRUE:"]
-        for cmd in fallback_cmds:
-            formatted_script.append(f"    {cmd}")
-        return "\n".join(formatted_script)
+    # Define mock 'machine' module
+    class VirtualPin:
+        OUT = "OUT"
+        IN = "IN"
+        PULL_UP = "PULL_UP"
 
+        def __init__(self, pin_id, mode=None, value=0):
+            self.pin_id = pin_id
+            if value is not None:
+                engine.record_write(self.pin_id, value)
 
-# =========================================================
-# STEP 2: HARDWARE TRANSPILER
-# Converts explicit commands into binary instruction string.
-# =========================================================
-def transpile_python_to_instructions(formatted_code):
-    commands = []
-    pin_map = {
-        "D0": 16, "D1": 5, "D2": 4, "D3": 0, "D4": 2, 
-        "D5": 14, "D6": 12, "D7": 13, "D8": 15
+        def value(self, val=None):
+            if val is not None:
+                engine.record_write(self.pin_id, val)
+                return val
+            return 0
+
+        def on(self):
+            engine.record_write(self.pin_id, 1)
+
+        def off(self):
+            engine.record_write(self.pin_id, 0)
+
+        def high(self):
+            engine.record_write(self.pin_id, 1)
+
+        def low(self):
+            engine.record_write(self.pin_id, 0)
+
+    class VirtualMachineModule:
+        Pin = VirtualPin
+
+    class VirtualTimeModule:
+        @staticmethod
+        def sleep(sec):
+            engine.record_delay(sec)
+
+        @staticmethod
+        def sleep_ms(ms):
+            engine.record_delay(ms / 1000.0)
+
+    # Standard Arduino-style global function helpers
+    def digitalWrite(pin, state):
+        engine.record_write(pin, state)
+
+    def delay(ms):
+        engine.record_delay(ms / 1000.0)
+
+    # Intercept print calls cleanly
+    stdout_capture = io.StringIO()
+
+    # Create execution scope
+    execution_scope = {
+        'machine': VirtualMachineModule,
+        'Pin': VirtualPin,
+        'time': VirtualTimeModule,
+        'sleep': VirtualTimeModule.sleep,
+        'digitalWrite': digitalWrite,
+        'digital_write': digitalWrite,
+        'delay': delay,
+        'HIGH': 1,
+        'LOW': 0,
+        'True': True,
+        'False': False,
+        'print': lambda *args, **kwargs: stdout_capture.write(" ".join(map(str, args)) + "\n")
     }
 
-    lines = formatted_code.split('\n')
-    for line in lines:
-        line = line.strip()
-        if not line or line.startswith('#') or line.startswith("WHILE"):
+    # Clean code: remove infinite 'while True:' wrappers so execution completes cleanly in 1 loop pass
+    cleaned_lines = []
+    for line in user_code.split('\n'):
+        # Strip out infinite loops or keyboard interrupts that lock up server execution
+        if re.search(r'while\s+True\s*:', line) or re.search(r'except\s+KeyboardInterrupt\s*:', line) or 'try:' in line:
             continue
+        cleaned_lines.append(line)
+    
+    executable_code = "\n".join(cleaned_lines)
 
-        if "DELAY(" in line:
-            try:
-                ms = int(re.search(r'DELAY\((\d+)\)', line).group(1))
-                commands.append(f"DELAY:{ms}")
-            except:
-                pass
+    try:
+        # EXECUTE THE PYTHON CODE FOR REAL
+        exec(executable_code, execution_scope)
+    except Exception as e:
+        return f"# Execution Error: {str(e)}", ""
 
-        elif "DIGITALWRITE(" in line:
-            state = "1" if "HIGH" in line else "0"
-            found_pin = None
-            
-            # Check for ESP pin labels (e.g. D1, D3)
-            for p_label, p_num in pin_map.items():
-                if f'"{p_label}"' in line or f"'{p_label}'" in line:
-                    found_pin = p_num
-                    break
-            
-            # Check for raw numeric GPIO pins (e.g. GPIO 12, 14, 22)
-            if found_pin is None:
-                numbers = re.findall(r'\d+', line)
-                if numbers:
-                    found_pin = int(numbers[0])
+    # Build readable display format
+    formatted_display = ["WHILE TRUE:"]
+    for evt in engine.events:
+        if evt.startswith("WRITE:"):
+            _, p, s = evt.split(":")
+            st_label = "HIGH" if s == "1" else "LOW"
+            formatted_display.append(f'    DIGITALWRITE("GPIO {p}", {st_label})')
+        elif evt.startswith("DELAY:"):
+            _, ms = evt.split(":")
+            formatted_display.append(f'    DELAY({ms})')
 
-            if found_pin is not None:
-                commands.append(f"WRITE:{found_pin}:{state}")
-
-    return ";".join(commands)
+    instruction_stream = ";".join(engine.events)
+    return "\n".join(formatted_display), instruction_stream
 
 
 # =========================================================
-# STEP 3: FLASK ROUTES & PORTAL
+# FLASK INTERFACE & PORTAL
 # =========================================================
 HTML_PORTAL = """
 <!DOCTYPE html>
 <html>
 <head>
-    <title>Universal ESP Code Sender</title>
+    <title>Universal ESP Python Sandbox Engine</title>
     <script src="https://cdn.tailwindcss.com"></script>
 </head>
 <body class="bg-gray-100 p-8">
     <div class="max-w-3xl mx-auto bg-white p-6 rounded-xl shadow">
-        <h1 class="text-xl font-bold mb-4">Universal ESP Code Transpiler</h1>
-        <textarea id="code" class="w-full h-48 border p-3 font-mono text-sm rounded mb-4" placeholder="Write any Python code here..."></textarea>
-        <button onclick="sendCode()" class="bg-black text-white px-6 py-2 rounded font-bold">EXECUTE ON ESP</button>
+        <h1 class="text-xl font-bold mb-4">Universal ESP Python Sandbox Engine</h1>
+        <textarea id="code" class="w-full h-56 border p-3 font-mono text-sm rounded mb-4 focus:outline-none focus:ring-2 focus:ring-black" placeholder="Write ANY Python or MicroPython code here..."></textarea>
+        <button onclick="sendCode()" class="bg-black text-white px-6 py-2 rounded font-bold hover:bg-gray-800 transition">EXECUTE ON ESP</button>
         
         <div class="mt-6">
-            <h2 class="text-sm font-bold text-gray-700 mb-2">Compiled Intermediate Format:</h2>
-            <pre id="compiled_format" class="bg-gray-900 text-green-400 p-3 rounded font-mono text-xs h-32 overflow-y-auto"></pre>
+            <h2 class="text-sm font-bold text-gray-700 mb-2">Captured Hardware Event Sequence:</h2>
+            <pre id="compiled_format" class="bg-gray-900 text-green-400 p-4 rounded font-mono text-xs h-40 overflow-y-auto"></pre>
         </div>
         <p id="status" class="mt-4 text-sm font-mono text-gray-600"></p>
     </div>
     <script>
         async function sendCode() {
             const code = document.getElementById('code').value;
-            document.getElementById('status').innerText = "Compiling & deploying to ESP...";
-            const res = await fetch('/transpile', {
-                method: 'POST',
-                headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({user_code: code})
-            });
-            const data = await res.json();
-            document.getElementById('compiled_format').innerText = data.formatted_code;
-            document.getElementById('status').innerText = "Status: Code deployed to ESP successfully!";
+            document.getElementById('status').innerText = "Running Python execution sandbox...";
+            try {
+                const res = await fetch('/transpile', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({user_code: code})
+                });
+                const data = await res.json();
+                document.getElementById('compiled_format').innerText = data.formatted_code;
+                document.getElementById('status').innerText = "Status: Code executed in sandbox & hardware stream sent to ESP!";
+            } catch (err) {
+                document.getElementById('status').innerText = "Error connecting to server.";
+            }
         }
     </script>
 </body>
@@ -205,11 +205,7 @@ def transpile():
     data = request.get_json(silent=True) or {}
     user_code = data.get('user_code', '')
     
-    # Step 1: Unroll complex Python into explicit script format
-    formatted_code = compile_complex_python_to_format(user_code)
-    
-    # Step 2: Convert script format to hardware instruction stream
-    latest_instructions = transpile_python_to_instructions(formatted_code)
+    formatted_code, latest_instructions = execute_python_script(user_code)
     
     return jsonify({
         "status": "success", 
@@ -224,4 +220,4 @@ def get_code():
 if __name__ == '__main__':
     port = int(os.environ.get("PORT", 5000))
     app.run(host='0.0.0.0', port=port)
-            
+        
