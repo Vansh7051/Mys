@@ -1,190 +1,246 @@
-# ==============================================================================
-# ENTERPRISE PYTHON-TO-C++ HARDWARE TRANSPILER ENGINE
-# Translates Python Hardware Code into Arduino/ESP C++ (Arduino Framework)
-# ==============================================================================
+import ast
 import os
 import re
-import ast
+from typing import List, Set, Dict
 from flask import Flask, request, jsonify
 
 app = Flask(__name__)
 
-def convert_python_to_cpp(raw_code: str) -> str:
+class CppASTTranspiler(ast.NodeVisitor):
     """
-    Sanitizes raw Python/mixed input and converts it into valid ESP/Arduino C++ code.
+    Advanced AST Visitor that walks Python code AST and transpiles it into
+    valid, statically typed Arduino C++ code.
     """
-    if not raw_code or not raw_code.strip():
-        return (
-            "#include <Arduino.h>\n\n"
-            "void setup() {}\n"
-            "void loop() {}\n"
-        )
+    def __init__(self):
+        self.includes: Set[str] = {"Arduino.h"}
+        self.global_vars: Dict[str, str] = {}  # var_name -> C++ type
+        self.pin_outputs: Set[str] = set()
+        self.pin_inputs: Set[str] = set()
+        self.setup_code: List[str] = []
+        self.loop_code: List[str] = []
+        self.functions: List[str] = []
 
-    # 1. Clean and normalize input lines
-    lines = raw_code.splitlines()
-    cleaned_lines = []
-
-    for line in lines:
-        stripped = line.strip()
-        
-        # Remove Python comments or C++ style comments
-        if stripped.startswith("#") and not stripped.startswith("#include"):
-            continue
-        if "//" in stripped:
-            stripped = stripped.split("//")[0].strip()
-
-        # Fix broken delay/sleep typos: time.sleep(.) -> time.sleep(1.0)
-        stripped = re.sub(r'time\.sleep\(\s*\.\s*\)', 'time.sleep(1.0)', stripped)
-        stripped = re.sub(r'delay\(\s*\.\s*\)', 'delay(1000)', stripped)
-
-        if stripped:
-            cleaned_lines.append(stripped)
-
-    clean_text = "\n".join(cleaned_lines)
-
-    # 2. Safely extract Pin Numbers
-    explicit_pins = re.findall(r'(?:pin_|Pin\(|digitalWrite\(\s*|pin\s*=\s*)(\d+)', clean_text, re.IGNORECASE)
-    
-    unique_pins = []
-    for p in explicit_pins:
-        if p not in unique_pins and int(p) <= 40:
-            unique_pins.append(p)
-
-    if not unique_pins:
-        unique_pins = ["5", "0", "14", "13", "2", "1"]
-
-    # 3. Build Loop Body (Translating Python lines into C++)
-    loop_body = []
-
-    for line in cleaned_lines:
-        line_lower = line.lower()
-
-        # Handle Sleep / Delay conversion
-        if "sleep" in line_lower or "delay" in line_lower:
-            nums = re.findall(r'\b\d+(?:\.\d+)?\b', line)
-            if nums:
-                val = float(nums[0])
-                # If value is in seconds (< 100), convert to milliseconds for C++ delay()
-                ms = int(val * 1000) if val <= 100 else int(val)
-                ms = max(100, ms)
+    def visit_Import(self, node: ast.Import):
+        for alias in node.names:
+            name = alias.name
+            if name in ["time", "utime"]:
+                pass  # Mapped to native delay() / delayMicroseconds()
+            elif name in ["machine", "driver"]:
+                pass  # Mapped to native Arduino GPIO
             else:
-                ms = 1000
-            loop_body.append(f"  delay({ms});")
+                # Dynamically convert python import module to C++ header
+                self.includes.add(f"{name}.h")
+        self.generic_visit(node)
 
-        # Handle Setting Pins HIGH / ON
-        elif "high" in line_lower or "value(1)" in line_lower or ("digitalwrite" in line_lower and ("1" in line_lower or "true" in line_lower)):
-            target_pins = re.findall(r'\b\d+\b', line)
-            pins_to_set = [p for p in target_pins if p in unique_pins] or unique_pins
-            for pin in pins_to_set:
-                loop_body.append(f"  digitalWrite({pin}, HIGH);")
+    def visit_ImportFrom(self, node: ast.ImportFrom):
+        if node.module:
+            if node.module not in ["time", "utime", "machine"]:
+                self.includes.add(f"{node.module}.h")
+        self.generic_visit(node)
 
-        # Handle Setting Pins LOW / OFF
-        elif "low" in line_lower or "value(0)" in line_lower or ("digitalwrite" in line_lower and ("0" in line_lower or "false" in line_lower)):
-            target_pins = re.findall(r'\b\d+\b', line)
-            pins_to_set = [p for p in target_pins if p in unique_pins] or unique_pins
-            for pin in pins_to_set:
-                loop_body.append(f"  digitalWrite({pin}, LOW);")
+    def visit_Assign(self, node: ast.Assign):
+        # Handles pin definitions like: led = Pin(5, Pin.OUT) or value assignments
+        var_name = node.targets[0].id if isinstance(node.targets[0], ast.Name) else "var"
+        
+        # Check if right-hand side is Pin instantiation
+        if isinstance(node.value, ast.Call):
+            func_name = self._get_full_func_name(node.value.func)
+            if "Pin" in func_name:
+                pin_num = self.visit(node.value.args[0])
+                mode = "OUTPUT"
+                if len(node.value.args) > 1:
+                    mode_str = ast.dump(node.value.args[1])
+                    if "IN" in mode_str:
+                        mode = "INPUT"
 
-    # Fallback pattern if no actionable pin triggers were identified
-    if not loop_body:
-        for pin in unique_pins:
-            loop_body.append(f"  digitalWrite({pin}, HIGH);")
-        loop_body.append("  delay(1000);")
-        for pin in unique_pins:
-            loop_body.append(f"  digitalWrite({pin}, LOW);")
-        loop_body.append("  delay(500);")
+                self.global_vars[var_name] = "int"
+                self.setup_code.append(f"  {var_name} = {pin_num};")
+                if mode == "OUTPUT":
+                    self.pin_outputs.add(var_name)
+                    self.setup_code.append(f"  pinMode({var_name}, OUTPUT);")
+                else:
+                    self.pin_inputs.add(var_name)
+                    self.setup_code.append(f"  pinMode({var_name}, INPUT);")
+                return
 
-    # 4. Construct Complete C++ File Output
-    cpp_output = [
-        "#include <Arduino.h>",
-        "",
-        "// Pin Definitions",
-    ]
-    for pin in unique_pins:
-        cpp_output.append(f"const int PIN_{pin} = {pin};")
+        # General variable assignments
+        cpp_val = self.visit(node.value)
+        inferred_type = "int"
+        if isinstance(node.value, ast.Constant):
+            if isinstance(node.value.value, float):
+                inferred_type = "float"
+            elif isinstance(node.value.value, str):
+                inferred_type = "String"
+            elif isinstance(node.value.value, bool):
+                inferred_type = "bool"
 
-    cpp_output.extend([
-        "",
-        "void setup() {"
-    ])
+        if var_name not in self.global_vars:
+            self.global_vars[var_name] = inferred_type
+            return f"  {inferred_type} {var_name} = {cpp_val};"
+        else:
+            return f"  {var_name} = {cpp_val};"
 
-    for pin in unique_pins:
-        cpp_output.append(f"  pinMode({pin}, OUTPUT);")
+    def visit_Call(self, node: ast.Call) -> str:
+        func_name = self._get_full_func_name(node.func)
+        args = [self.visit(arg) for arg in node.args]
 
-    cpp_output.extend([
-        "}",
-        "",
-        "void loop() {"
-    ])
+        # 1. Delay conversions
+        if func_name in ["time.sleep", "utime.sleep", "sleep"]:
+            # If argument is float seconds, convert to milliseconds
+            sec = args[0] if args else "1"
+            try:
+                ms = int(float(sec) * 1000)
+                return f"delay({ms});"
+            except ValueError:
+                return f"delay((unsigned long)(({sec}) * 1000));"
+
+        elif func_name in ["time.sleep_ms", "utime.sleep_ms", "delay"]:
+            return f"delay({args[0] if args else '1000'});"
+
+        # 2. GPIO methods: pin.value(1) or pin.on() / pin.off()
+        elif ".value" in func_name or ".on" in func_name or ".off" in func_name:
+            obj_name = func_name.split(".")[0]
+            if ".on" in func_name:
+                val = "HIGH"
+            elif ".off" in func_name:
+                val = "LOW"
+            else:
+                val = "HIGH" if args and args[0] in ["1", "True"] else "LOW"
+            return f"digitalWrite({obj_name}, {val});"
+
+        # 3. Print statements to Serial
+        elif func_name == "print":
+            self.setup_code.append("  Serial.begin(115200);")
+            return f'Serial.println({", ".join(args)});'
+
+        # Default fallback: Direct function call
+        return f"{func_name}({', '.join(args)});"
+
+    def visit_If(self, node: ast.If) -> str:
+        test = self.visit(node.test)
+        body = "\n".join([self.visit(stmt) for stmt in node.body if self.visit(stmt)])
+        orelse = ""
+        if node.orelse:
+            else_body = "\n".join([self.visit(stmt) for stmt in node.orelse if self.visit(stmt)])
+            orelse = f" else {{\n{else_body}\n}}"
+        return f"  if ({test}) {{\n{body}\n}}{orelse}"
+
+    def visit_For(self, node: ast.For) -> str:
+        # Handles for i in range(x)
+        var = node.target.id if isinstance(node.target, ast.Name) else "i"
+        limit = "10"
+        if isinstance(node.iter, ast.Call) and getattr(node.iter.func, 'id', '') == 'range':
+            limit = self.visit(node.iter.args[0])
+        
+        body = "\n".join([self.visit(stmt) for stmt in node.body if self.visit(stmt)])
+        return f"  for (int {var} = 0; {var} < {limit}; {var}++) {{\n{body}\n  }}"
+
+    def visit_While(self, node: ast.While) -> str:
+        test = self.visit(node.test)
+        body = "\n".join([self.visit(stmt) for stmt in node.body if self.visit(stmt)])
+        return f"  while ({test}) {{\n{body}\n  }}"
+
+    def visit_BinOp(self, node: ast.BinOp) -> str:
+        left = self.visit(node.left)
+        right = self.visit(node.right)
+        op_map = {
+            ast.Add: "+", ast.Sub: "-", ast.Mult: "*", ast.Div: "/",
+            ast.Mod: "%", ast.BitAnd: "&", ast.BitOr: "|"
+        }
+        op = op_map.get(type(node.op), "+")
+        return f"({left} {op} {right})"
+
+    def visit_Compare(self, node: ast.Compare) -> str:
+        left = self.visit(node.left)
+        comparators = [self.visit(c) for c in node.comparators]
+        op_map = {
+            ast.Eq: "==", ast.NotEq: "!=", ast.Lt: "<",
+            ast.LtE: "<=", ast.Gt: ">", ast.GtE: ">="
+        }
+        op = op_map.get(type(node.ops[0]), "==")
+        return f"{left} {op} {comparators[0]}"
+
+    def visit_Constant(self, node: ast.Constant) -> str:
+        if isinstance(node.value, str):
+            return f'"{node.value}"'
+        elif isinstance(node.value, bool):
+            return "true" if node.value else "false"
+        return str(node.value)
+
+    def visit_Name(self, node: ast.Name) -> str:
+        return node.id
+
+    def visit_Expr(self, node: ast.Expr):
+        res = self.visit(node.value)
+        return f"  {res}" if res and not res.endswith(";") else res
+
+    def _get_full_func_name(self, node) -> str:
+        if isinstance(node, ast.Name):
+            return node.id
+        elif isinstance(node, ast.Attribute):
+            return f"{self._get_full_func_name(node.value)}.{node.attr}"
+        return "unknown"
+
+
+def transpile_python_to_cpp(py_code: str) -> str:
+    """Entry point for parsing Python and emitting structured Arduino C++ code."""
+    if not py_code.strip():
+        return "#include <Arduino.h>\n\nvoid setup() {}\nvoid loop() {}\n"
+
+    try:
+        tree = ast.parse(py_code)
+    except SyntaxError as e:
+        return f"// Transpilation Error: Invalid Python Syntax\n// {str(e)}"
+
+    transpiler = CppASTTranspiler()
+    statements = []
+
+    for stmt in tree.body:
+        res = transpiler.visit(stmt)
+        if res:
+            statements.append(res)
+
+    # Reconstruct standard C++ structure
+    cpp_out = []
     
-    cpp_output.extend(loop_body)
-    cpp_output.extend([
-        "}",
-        ""
-    ])
+    # 1. Includes
+    for inc in sorted(transpiler.includes):
+        cpp_out.append(f"#include <{inc}>")
+    cpp_out.append("")
 
-    return "\n".join(cpp_output)
+    # 2. Global variables
+    for var, vtype in transpiler.global_vars.items():
+        cpp_out.append(f"{vtype} {var};")
+    cpp_out.append("")
 
+    # 3. void setup()
+    cpp_out.append("void setup() {")
+    # Deduplicate setup routines
+    seen_setup = set()
+    for s in transpiler.setup_code:
+        if s not in seen_setup:
+            cpp_out.append(s)
+            seen_setup.add(s)
+    cpp_out.append("}")
+    cpp_out.append("")
 
-# ------------------------------------------------------------------------------
-# REST API ENDPOINTS
-# ------------------------------------------------------------------------------
-@app.route("/", methods=["GET"])
-def home():
-    """Web Dashboard for Testing Python to C++ Conversion"""
-    return """
-    <!DOCTYPE html>
-    <html>
-    <head>
-        <title>Python to C++ Hardware Transpiler</title>
-        <style>
-            body { font-family: system-ui, sans-serif; padding: 25px; background: #090d16; color: #f8fafc; }
-            textarea { width: 100%; height: 260px; background: #1e293b; color: #38bdf8; font-family: monospace; padding: 14px; border-radius: 8px; border: 1px solid #334155; }
-            button { background: #0284c7; color: white; padding: 12px 24px; border: none; border-radius: 6px; cursor: pointer; font-size: 16px; margin-top: 12px; font-weight: bold; }
-            button:hover { background: #0369a1; }
-            pre { background: #1e293b; padding: 18px; color: #4ade80; border-radius: 8px; font-family: monospace; border: 1px solid #334155; overflow-x: auto; }
-        </style>
-    </head>
-    <body>
-        <h2>Python to ESP/Arduino C++ Transpiler</h2>
-        <p>Paste your Python code below to generate valid C++ (.ino) code:</p>
-        <textarea id="code">from machine import Pin\nimport time\n\npin_5 = Pin(5, Pin.OUT)\npin_5.value(1)\ntime.sleep(1.0)\npin_5.value(0)\ntime.sleep(.)</textarea><br>
-        <button onclick="transpile()">Transpile to C++</button>
-        <h3>Generated ESP/Arduino C++ Output:</h3>
-        <pre id="output">C++ output will render here...</pre>
+    # 4. void loop()
+    cpp_out.append("void loop() {")
+    for stmt in statements:
+        if stmt and not stmt.startswith("#include"):
+            cpp_out.append(stmt if stmt.endswith(";") or stmt.endswith("}") else f"{stmt};")
+    cpp_out.append("}")
 
-        <script>
-            async function transpile() {
-                const input = document.getElementById('code').value;
-                const res = await fetch('/transpile', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ code: input })
-                });
-                const data = await res.json();
-                document.getElementById('output').textContent = data.result;
-            }
-        </script>
-    </body>
-    </html>
-    """
+    return "\n".join(cpp_out)
+
 
 @app.route("/transpile", methods=["POST"])
 def transpile():
-    """REST API Endpoint for Clients"""
     data = request.get_json(force=True, silent=True) or {}
     raw_code = data.get("code", "")
-    cpp_result = convert_python_to_cpp(raw_code)
-    return jsonify({
-        "status": "success",
-        "result": cpp_result
-    })
+    cpp_result = transpile_python_to_cpp(raw_code)
+    return jsonify({"status": "success", "result": cpp_result})
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5000))
-    print("==================================================")
-    print("  PYTHON TO C++ TRANSPILER SERVER RUNNING         ")
-    print(f"  URL: http://0.0.0.0:{port}                     ")
-    print("==================================================")
-    app.run(host="0.0.0.0", port=port, debug=False)
-        
+    app.run(host="0.0.0.0", port=5000, debug=False)
+    
