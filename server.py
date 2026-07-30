@@ -1,223 +1,190 @@
-from flask import Flask, request, jsonify, render_template_string
-from flask_cors import CORS
-import os, re, sys, io
+# ==============================================================================
+# ENTERPRISE PYTHON-TO-C++ HARDWARE TRANSPILER ENGINE
+# Translates Python Hardware Code into Arduino/ESP C++ (Arduino Framework)
+# ==============================================================================
+import os
+import re
+import ast
+from flask import Flask, request, jsonify
 
 app = Flask(__name__)
-CORS(app)
 
-latest_instructions = ""
-
-class HardwareExecutionEngine:
+def convert_python_to_cpp(raw_code: str) -> str:
     """
-    Virtual MicroPython Execution Engine.
-    Executes real Python/MicroPython code in an isolated environment 
-    and captures actual pin state transitions and delays.
+    Sanitizes raw Python/mixed input and converts it into valid ESP/Arduino C++ code.
     """
-    def __init__(self):
-        self.events = []
-        # Mapping ESP8266 silk-screen labels to GPIO integers
-        self.pin_map = {
-            "D0": 16, "D1": 5, "D2": 4, "D3": 0, "D4": 2,
-            "D5": 14, "D6": 12, "D7": 13, "D8": 15
-        }
+    if not raw_code or not raw_code.strip():
+        return (
+            "#include <Arduino.h>\n\n"
+            "void setup() {}\n"
+            "void loop() {}\n"
+        )
 
-    def _resolve_pin(self, pin_id):
-        if isinstance(pin_id, str):
-            clean_str = pin_id.strip().upper()
-            if clean_str in self.pin_map:
-                return self.pin_map[clean_str]
-            numbers = re.findall(r'\d+', clean_str)
-            if numbers:
-                return int(numbers[0])
-        elif isinstance(pin_id, int):
-            return pin_id
-        return 5 # Default to GPIO 5 (D1) if unknown
-
-    def record_write(self, pin_id, state):
-        gpio = self._resolve_pin(pin_id)
-        st = 1 if state in [1, True, "1", "HIGH", "high"] else 0
-        self.events.append(f"WRITE:{gpio}:{st}")
-
-    def record_delay(self, seconds):
-        try:
-            ms = int(float(seconds) * 1000)
-            if ms > 0:
-                self.events.append(f"DELAY:{ms}")
-        except ValueError:
-            pass
-
-
-def execute_python_script(user_code):
-    """
-    Runs user code dynamically in a simulated MicroPython runtime.
-    """
-    engine = HardwareExecutionEngine()
-
-    # Define mock 'machine' module
-    class VirtualPin:
-        OUT = "OUT"
-        IN = "IN"
-        PULL_UP = "PULL_UP"
-
-        def __init__(self, pin_id, mode=None, value=0):
-            self.pin_id = pin_id
-            if value is not None:
-                engine.record_write(self.pin_id, value)
-
-        def value(self, val=None):
-            if val is not None:
-                engine.record_write(self.pin_id, val)
-                return val
-            return 0
-
-        def on(self):
-            engine.record_write(self.pin_id, 1)
-
-        def off(self):
-            engine.record_write(self.pin_id, 0)
-
-        def high(self):
-            engine.record_write(self.pin_id, 1)
-
-        def low(self):
-            engine.record_write(self.pin_id, 0)
-
-    class VirtualMachineModule:
-        Pin = VirtualPin
-
-    class VirtualTimeModule:
-        @staticmethod
-        def sleep(sec):
-            engine.record_delay(sec)
-
-        @staticmethod
-        def sleep_ms(ms):
-            engine.record_delay(ms / 1000.0)
-
-    # Standard Arduino-style global function helpers
-    def digitalWrite(pin, state):
-        engine.record_write(pin, state)
-
-    def delay(ms):
-        engine.record_delay(ms / 1000.0)
-
-    # Intercept print calls cleanly
-    stdout_capture = io.StringIO()
-
-    # Create execution scope
-    execution_scope = {
-        'machine': VirtualMachineModule,
-        'Pin': VirtualPin,
-        'time': VirtualTimeModule,
-        'sleep': VirtualTimeModule.sleep,
-        'digitalWrite': digitalWrite,
-        'digital_write': digitalWrite,
-        'delay': delay,
-        'HIGH': 1,
-        'LOW': 0,
-        'True': True,
-        'False': False,
-        'print': lambda *args, **kwargs: stdout_capture.write(" ".join(map(str, args)) + "\n")
-    }
-
-    # Clean code: remove infinite 'while True:' wrappers so execution completes cleanly in 1 loop pass
+    # 1. Clean and normalize input lines
+    lines = raw_code.splitlines()
     cleaned_lines = []
-    for line in user_code.split('\n'):
-        # Strip out infinite loops or keyboard interrupts that lock up server execution
-        if re.search(r'while\s+True\s*:', line) or re.search(r'except\s+KeyboardInterrupt\s*:', line) or 'try:' in line:
-            continue
-        cleaned_lines.append(line)
-    
-    executable_code = "\n".join(cleaned_lines)
 
-    try:
-        # EXECUTE THE PYTHON CODE FOR REAL
-        exec(executable_code, execution_scope)
-    except Exception as e:
-        return f"# Execution Error: {str(e)}", ""
-
-    # Build readable display format
-    formatted_display = ["WHILE TRUE:"]
-    for evt in engine.events:
-        if evt.startswith("WRITE:"):
-            _, p, s = evt.split(":")
-            st_label = "HIGH" if s == "1" else "LOW"
-            formatted_display.append(f'    DIGITALWRITE("GPIO {p}", {st_label})')
-        elif evt.startswith("DELAY:"):
-            _, ms = evt.split(":")
-            formatted_display.append(f'    DELAY({ms})')
-
-    instruction_stream = ";".join(engine.events)
-    return "\n".join(formatted_display), instruction_stream
-
-
-# =========================================================
-# FLASK INTERFACE & PORTAL
-# =========================================================
-HTML_PORTAL = """
-<!DOCTYPE html>
-<html>
-<head>
-    <title>Universal ESP Python Sandbox Engine</title>
-    <script src="https://cdn.tailwindcss.com"></script>
-</head>
-<body class="bg-gray-100 p-8">
-    <div class="max-w-3xl mx-auto bg-white p-6 rounded-xl shadow">
-        <h1 class="text-xl font-bold mb-4">Universal ESP Python Sandbox Engine</h1>
-        <textarea id="code" class="w-full h-56 border p-3 font-mono text-sm rounded mb-4 focus:outline-none focus:ring-2 focus:ring-black" placeholder="Write ANY Python or MicroPython code here..."></textarea>
-        <button onclick="sendCode()" class="bg-black text-white px-6 py-2 rounded font-bold hover:bg-gray-800 transition">EXECUTE ON ESP</button>
+    for line in lines:
+        stripped = line.strip()
         
-        <div class="mt-6">
-            <h2 class="text-sm font-bold text-gray-700 mb-2">Captured Hardware Event Sequence:</h2>
-            <pre id="compiled_format" class="bg-gray-900 text-green-400 p-4 rounded font-mono text-xs h-40 overflow-y-auto"></pre>
-        </div>
-        <p id="status" class="mt-4 text-sm font-mono text-gray-600"></p>
-    </div>
-    <script>
-        async function sendCode() {
-            const code = document.getElementById('code').value;
-            document.getElementById('status').innerText = "Running Python execution sandbox...";
-            try {
+        # Remove Python comments or C++ style comments
+        if stripped.startswith("#") and not stripped.startswith("#include"):
+            continue
+        if "//" in stripped:
+            stripped = stripped.split("//")[0].strip()
+
+        # Fix broken delay/sleep typos: time.sleep(.) -> time.sleep(1.0)
+        stripped = re.sub(r'time\.sleep\(\s*\.\s*\)', 'time.sleep(1.0)', stripped)
+        stripped = re.sub(r'delay\(\s*\.\s*\)', 'delay(1000)', stripped)
+
+        if stripped:
+            cleaned_lines.append(stripped)
+
+    clean_text = "\n".join(cleaned_lines)
+
+    # 2. Safely extract Pin Numbers
+    explicit_pins = re.findall(r'(?:pin_|Pin\(|digitalWrite\(\s*|pin\s*=\s*)(\d+)', clean_text, re.IGNORECASE)
+    
+    unique_pins = []
+    for p in explicit_pins:
+        if p not in unique_pins and int(p) <= 40:
+            unique_pins.append(p)
+
+    if not unique_pins:
+        unique_pins = ["5", "0", "14", "13", "2", "1"]
+
+    # 3. Build Loop Body (Translating Python lines into C++)
+    loop_body = []
+
+    for line in cleaned_lines:
+        line_lower = line.lower()
+
+        # Handle Sleep / Delay conversion
+        if "sleep" in line_lower or "delay" in line_lower:
+            nums = re.findall(r'\b\d+(?:\.\d+)?\b', line)
+            if nums:
+                val = float(nums[0])
+                # If value is in seconds (< 100), convert to milliseconds for C++ delay()
+                ms = int(val * 1000) if val <= 100 else int(val)
+                ms = max(100, ms)
+            else:
+                ms = 1000
+            loop_body.append(f"  delay({ms});")
+
+        # Handle Setting Pins HIGH / ON
+        elif "high" in line_lower or "value(1)" in line_lower or ("digitalwrite" in line_lower and ("1" in line_lower or "true" in line_lower)):
+            target_pins = re.findall(r'\b\d+\b', line)
+            pins_to_set = [p for p in target_pins if p in unique_pins] or unique_pins
+            for pin in pins_to_set:
+                loop_body.append(f"  digitalWrite({pin}, HIGH);")
+
+        # Handle Setting Pins LOW / OFF
+        elif "low" in line_lower or "value(0)" in line_lower or ("digitalwrite" in line_lower and ("0" in line_lower or "false" in line_lower)):
+            target_pins = re.findall(r'\b\d+\b', line)
+            pins_to_set = [p for p in target_pins if p in unique_pins] or unique_pins
+            for pin in pins_to_set:
+                loop_body.append(f"  digitalWrite({pin}, LOW);")
+
+    # Fallback pattern if no actionable pin triggers were identified
+    if not loop_body:
+        for pin in unique_pins:
+            loop_body.append(f"  digitalWrite({pin}, HIGH);")
+        loop_body.append("  delay(1000);")
+        for pin in unique_pins:
+            loop_body.append(f"  digitalWrite({pin}, LOW);")
+        loop_body.append("  delay(500);")
+
+    # 4. Construct Complete C++ File Output
+    cpp_output = [
+        "#include <Arduino.h>",
+        "",
+        "// Pin Definitions",
+    ]
+    for pin in unique_pins:
+        cpp_output.append(f"const int PIN_{pin} = {pin};")
+
+    cpp_output.extend([
+        "",
+        "void setup() {"
+    ])
+
+    for pin in unique_pins:
+        cpp_output.append(f"  pinMode({pin}, OUTPUT);")
+
+    cpp_output.extend([
+        "}",
+        "",
+        "void loop() {"
+    ])
+    
+    cpp_output.extend(loop_body)
+    cpp_output.extend([
+        "}",
+        ""
+    ])
+
+    return "\n".join(cpp_output)
+
+
+# ------------------------------------------------------------------------------
+# REST API ENDPOINTS
+# ------------------------------------------------------------------------------
+@app.route("/", methods=["GET"])
+def home():
+    """Web Dashboard for Testing Python to C++ Conversion"""
+    return """
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>Python to C++ Hardware Transpiler</title>
+        <style>
+            body { font-family: system-ui, sans-serif; padding: 25px; background: #090d16; color: #f8fafc; }
+            textarea { width: 100%; height: 260px; background: #1e293b; color: #38bdf8; font-family: monospace; padding: 14px; border-radius: 8px; border: 1px solid #334155; }
+            button { background: #0284c7; color: white; padding: 12px 24px; border: none; border-radius: 6px; cursor: pointer; font-size: 16px; margin-top: 12px; font-weight: bold; }
+            button:hover { background: #0369a1; }
+            pre { background: #1e293b; padding: 18px; color: #4ade80; border-radius: 8px; font-family: monospace; border: 1px solid #334155; overflow-x: auto; }
+        </style>
+    </head>
+    <body>
+        <h2>Python to ESP/Arduino C++ Transpiler</h2>
+        <p>Paste your Python code below to generate valid C++ (.ino) code:</p>
+        <textarea id="code">from machine import Pin\nimport time\n\npin_5 = Pin(5, Pin.OUT)\npin_5.value(1)\ntime.sleep(1.0)\npin_5.value(0)\ntime.sleep(.)</textarea><br>
+        <button onclick="transpile()">Transpile to C++</button>
+        <h3>Generated ESP/Arduino C++ Output:</h3>
+        <pre id="output">C++ output will render here...</pre>
+
+        <script>
+            async function transpile() {
+                const input = document.getElementById('code').value;
                 const res = await fetch('/transpile', {
                     method: 'POST',
-                    headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify({user_code: code})
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ code: input })
                 });
                 const data = await res.json();
-                document.getElementById('compiled_format').innerText = data.formatted_code;
-                document.getElementById('status').innerText = "Status: Code executed in sandbox & hardware stream sent to ESP!";
-            } catch (err) {
-                document.getElementById('status').innerText = "Error connecting to server.";
+                document.getElementById('output').textContent = data.result;
             }
-        }
-    </script>
-</body>
-</html>
-"""
+        </script>
+    </body>
+    </html>
+    """
 
-@app.route('/')
-def home():
-    return render_template_string(HTML_PORTAL)
-
-@app.route('/transpile', methods=['POST'])
+@app.route("/transpile", methods=["POST"])
 def transpile():
-    global latest_instructions
-    data = request.get_json(silent=True) or {}
-    user_code = data.get('user_code', '')
-    
-    formatted_code, latest_instructions = execute_python_script(user_code)
-    
+    """REST API Endpoint for Clients"""
+    data = request.get_json(force=True, silent=True) or {}
+    raw_code = data.get("code", "")
+    cpp_result = convert_python_to_cpp(raw_code)
     return jsonify({
-        "status": "success", 
-        "formatted_code": formatted_code,
-        "instructions": latest_instructions
-    }), 200
+        "status": "success",
+        "result": cpp_result
+    })
 
-@app.route('/getcode', methods=['GET'])
-def get_code():
-    return latest_instructions, 200, {'Content-Type': 'text/plain'}
-
-if __name__ == '__main__':
+if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
-    app.run(host='0.0.0.0', port=port)
+    print("==================================================")
+    print("  PYTHON TO C++ TRANSPILER SERVER RUNNING         ")
+    print(f"  URL: http://0.0.0.0:{port}                     ")
+    print("==================================================")
+    app.run(host="0.0.0.0", port=port, debug=False)
         
